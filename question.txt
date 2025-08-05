@@ -1,0 +1,9 @@
+Scrape the list of Nobel Prize winners from:
+https://en.wikipedia.org/wiki/List_of_Nobel_laureates
+
+Answer the following questions and respond with a JSON array of strings containing the answer.
+
+1. How many Indian Nobel laureates have won in Peace or Literature?
+2. Which decade had the highest number of Nobel laureates overall?
+3. Identify any laureate who has won more than once and mention the categories.
+4. Plot a line chart showing the number of laureates per year from 1901 to 2023. Return it as a base64 image URI under 100,000 bytes.

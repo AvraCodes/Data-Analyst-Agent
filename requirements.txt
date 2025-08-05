@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-dotenv
+google-generativeai
+playwright
+beautifulsoup4
+pandas
+matplotlib
+openai
+aiofiles
+requests
