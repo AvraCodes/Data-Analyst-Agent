@@ -1,26 +1,18 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import google.generativeai as genai
 import os
-from dotenv import load_dotenv
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
-from typing import Dict, Any
-import re
 import json
-import matplotlib.pyplot as plt
-import base64
-from io import BytesIO
-import pandas as pd
 import subprocess
-import openai
+import re
 import logging
-import tempfile
-from fastapi.responses import JSONResponse
+from typing import List
+from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Data Analyst Agent", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,440 +22,208 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Set up logging to a file
-logging.basicConfig(
-    filename="agent_logs.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def get_relevant_data(file_name: str, css_selector: str = None) -> Dict[str, Any]:
-    """Extract data from HTML file using BeautifulSoup."""
-    with open(file_name, encoding="utf-8") as f:
-        html = f.read()
-    soup = BeautifulSoup(html, "html.parser")
+def extract_code_from_response(response_text: str) -> str:
+    """Extract Python code from LLM response"""
+    # Try to find code between ```python and ``` or just between ```
+    patterns = [
+        r'```python\n(.*?)```',
+        r'```\n(.*?)```',
+        r'```(.*?)```'
+    ]
     
-    if css_selector:
-        elements = soup.select(css_selector)
-        return {"data": [el.get_text(strip=True) for el in elements]}
-    return {"data": soup.get_text(strip=True)}
+    for pattern in patterns:
+        match = re.search(pattern, response_text, re.DOTALL)
+        if match:
+            code = match.group(1).strip()
+            # Basic validation
+            if any(keyword in code for keyword in ['import', 'def', 'print', 'json']):
+                return code
+    
+    return None
 
-async def scrape_website(url: str) -> str:
-    """Scrape website content using Playwright."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            content = await page.content()
-            # Save content to file
-            with open("scraped_content.html", "w", encoding="utf-8") as file:
-                file.write(content)
-            return content
-        except Exception as e:
-            return f"Error scraping website: {str(e)}"
-        finally:
-            await browser.close()
-
-async def scrape_specific_data(url: str, selector: str = None) -> Dict[str, Any]:
-    """
-    Scrape specific data from a website using selectors.
-    Args:
-        url: Website URL to scrape
-        selector: CSS selector to target specific elements (e.g., "div.article", "h1.title")
-    Returns:
-        Dictionary containing scraped data
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            # Navigate to the page and wait for content
-            await page.goto(url, wait_until="networkidle")
-            
-            # If selector is provided, wait for it and get specific content
-            if selector:
-                await page.wait_for_selector(selector)
-                elements = await page.query_selector_all(selector)
-                data = []
-                for element in elements:
-                    text = await element.text_content()
-                    data.append(text.strip())
-                return {"data": data, "url": url}
-            
-            # If no selector, get full page content
-            content = await page.content()
-            soup = BeautifulSoup(content, 'html.parser')
-            return {"data": soup.get_text(strip=True), "url": url}
-            
-        except Exception as e:
-            return {"error": f"Failed to scrape {url}: {str(e)}"}
-        finally:
-            await browser.close()
-
-def task_breakdown(task: str):
-    """Breaks down a task into smaller programmable steps using Google GenAI."""
+def get_gemini_response(prompt: str) -> str:
+    """Get response from Gemini with proper error handling"""
     try:
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         model = genai.GenerativeModel("gemini-2.5-pro")
         
-        # Read prompt template
-        try:
-            with open('prompt.txt', 'r') as f:
-                task_breakdown_prompt = f.read()
-        except FileNotFoundError:
-            task_breakdown_prompt = """Break down this task into clear steps:
+        response = model.generate_content(prompt)
+        
+        # Extract text properly
+        if hasattr(response, 'text') and response.text:
+            return response.text.strip()
+        elif hasattr(response, 'candidates') and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                text = ''.join([part.text for part in candidate.content.parts if hasattr(part, 'text')])
+                return text.strip()
+        
+        return ""
+    except Exception as e:
+        logging.error(f"Gemini API error: {str(e)}")
+        return ""
 
-When parsing tables:
-- Use BeautifulSoup + pandas.read_html with StringIO.
-- If the DataFrame has a MultiIndex as columns, flatten it:
-    df.columns = [' '.join(col).strip() if isinstance(col, tuple) else col for col in df.columns]
-- Use partial/lowercase substring matching to locate relevant columns.
-    Example:
-    for col in df.columns:
-        if "population" in col.lower() and "density" not in col.lower():
-            population_col = col
-            break
-- If the column isn’t found, print: f"Available columns: {df.columns}" and raise a clear error.
+def analyze_data(questions_content: str, additional_files: List[UploadFile] = None):
+    """Main data analysis function"""
+    try:
+        # Read system prompt
+        with open("prompt.txt", "r") as f:
+            system_prompt = f.read()
+
+        # Phase 1: Try direct answers
+        phase1_prompt = f"""
+{system_prompt}
+
+Questions to answer:
+{questions_content}
+
+Instructions: Try to answer these questions directly using your knowledge. 
+If you can provide ALL answers with confidence, respond with ONLY a clean JSON array/object (depending on the format requested in questions).
+If you need to scrape data or cannot answer with certainty, respond with exactly: "NEED_SCRAPING"
+
+Respond now:
 """
-        
-        prompt = f"{task_breakdown_prompt}\n{task}"
-        response = model.generate_content(prompt)
-        
-        # Save for debugging
-        with open('broken_task.txt', 'w') as f:
-            f.write(response.text)
-        
-        return response.text
-    except Exception as e:
-        return f"Error in task breakdown: {str(e)}"
 
-async def scrape_with_query(url: str, query: str) -> Dict[str, Any]:
-    """
-    Scrape website based on a natural language query.
-    Args:
-        url: Website URL to scrape
-        query: Natural language query (e.g., "find all article titles", "get contact information")
-    Returns:
-        Dictionary containing scraped data
-    """
-    # Configure Gemini to help determine selectors
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-pro")
-    
-    try:
-        # Get CSS selector from query using Gemini
-        prompt = f"""
-        Convert this query into appropriate CSS selectors for web scraping:
-        Query: {query}
-        Website: {url}
-        Return only the CSS selector without explanation.
-        """
-        response = model.generate_content(prompt)
-        selector = response.text.strip()
-        
-        # Use the generated selector to scrape
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+        direct_response = get_gemini_response(phase1_prompt)
+        logging.info(f"Phase 1 response: {direct_response[:200]}...")
+
+        # Check if we got direct answers
+        if direct_response and direct_response != "NEED_SCRAPING":
             try:
-                await page.goto(url, wait_until="networkidle")
-                await page.wait_for_selector(selector, timeout=5000)
-                elements = await page.query_selector_all(selector)
-                
-                data = []
-                for element in elements:
-                    text = await element.text_content()
-                    data.append(text.strip())
-                
-                return {
-                    "query": query,
-                    "url": url,
-                    "selector_used": selector,
-                    "data": data
-                }
-            
-            except Exception as e:
-                return {"error": f"Failed to scrape: {str(e)}"}
-            finally:
-                await browser.close()
-                
-    except Exception as e:
-        return {"error": f"Failed to process query: {str(e)}"}
+                # Try to parse as JSON
+                if (direct_response.startswith('[') or direct_response.startswith('{')):
+                    answers = json.loads(direct_response)
+                    logging.info("Phase 1 successful - returning direct answers")
+                    return answers
+            except json.JSONDecodeError:
+                logging.info("Phase 1 response not valid JSON, proceeding to Phase 2")
 
-async def process_query_file(file_content: str, url: str) -> Dict[str, Any]:
-    """
-    Process multiple queries from a text file for a given URL.
-    Each line in the file is treated as a separate query.
-    
-    Args:
-        file_content: Content of the text file with queries
-        url: Website URL to scrape
-    Returns:
-        Dictionary containing results for each query
-    """
-    queries = [q.strip() for q in file_content.splitlines() if q.strip()]
-    results = []
-    
-    for query in queries:
-        result = await scrape_with_query(url, query)
-        results.append({
-            "query": query,
-            "result": result
-        })
-    
-    return {
-        "url": url,
-        "total_queries": len(queries),
-        "results": results
-    }
+        # Phase 2: Generate scraping code
+        logging.info("Phase 2: Generating scraping code")
+        
+        # Detect output format from questions
+        is_json_object = "respond with a JSON object" in questions_content.lower()
+        output_format = "JSON object" if is_json_object else "JSON array"
 
-@app.get("/")
-async def root():
-    return {"message": "Hello!"}
+        phase2_prompt = f"""
+{system_prompt}
 
-@app.post("/api/scrape")
-async def scrape_url(url: str):
-    content = await scrape_website(url)
-    return {"content": get_relevant_data("scraped_content.html")}
+Questions to answer:
+{questions_content}
 
-@app.post("/api/process")
-async def process_file(file: UploadFile = File(...)):
-    if not file.filename.endswith('.txt'):
-        return {"error": "Only .txt files are supported"}
-    contents = await file.read()
-    text_content = contents.decode('utf-8')
-    result = task_breakdown(text_content)
-    return {
-        "file_name": file.filename,
-        "result": result,
-        "message": "File processed successfully!"
-    }
+Generate a complete Python script that:
+1. Scrapes/analyzes the required data
+2. Answers ALL questions precisely
+3. Outputs results as a {output_format} using: print(json.dumps(answers))
 
-@app.post("/api/scrape-data")
-async def scrape_endpoint(url: str, selector: str = None):
-    """API endpoint to scrape specific data from a website"""
-    result = await scrape_specific_data(url, selector)
-    return result
+Requirements:
+- Use requests, pandas, matplotlib, scipy, duckdb as needed
+- Handle all errors gracefully with try/except
+- For plots: return base64 PNG data URI under 100KB
+- Clean data properly (remove symbols, handle missing values)
+- Make the script robust and self-contained
 
-@app.post("/api/smart-scrape")
-async def smart_scrape_endpoint(url: str, query: str):
-    """API endpoint that accepts a URL and natural language query"""
-    result = await scrape_with_query(url, query)
-    return result
+Generate ONLY the Python code:
+"""
 
-@app.post("/api/bulk-scrape")
-async def bulk_scrape_endpoint(
-    file: UploadFile = File(...),
-    url: str = None
-):
-    """API endpoint that accepts a text file with multiple queries"""
-    if not file.filename.endswith('.txt'):
-        return {"error": "Only .txt files are supported"}
-    if not url:
-        return {"error": "URL parameter is required"}
-    
-    try:
-        contents = await file.read()
-        text_content = contents.decode('utf-8')
-        result = await process_query_file(text_content, url)
-        return {
-            "file_name": file.filename,
-            "url": url,
-            "results": result,
-            "message": "Queries processed successfully!"
-        }
-    except Exception as e:
-        return {"error": f"Failed to process queries: {str(e)}"}
+        code_response = get_gemini_response(phase2_prompt)
+        
+        if not code_response:
+            return ["Error: Could not generate analysis code"]
 
-MAX_RETRIES = 2  # Prevent infinite loops
+        # Extract and save code
+        code = extract_code_from_response(code_response)
+        if not code:
+            # If no code blocks found, assume entire response is code
+            code = code_response
 
-@app.post("/api/")
-async def universal_question_endpoint(file: UploadFile = File(...)):
-    question_content = (await file.read()).decode("utf-8")
-    with open("prompt.txt", "r") as f:
-        prompt_content = f.read()
-    llm_prompt = prompt_content + "\n\n" + question_content
-
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-pro")
-
-    error_message = None
-    for attempt in range(MAX_RETRIES):
-        prompt_to_send = llm_prompt
-        if error_message:
-            prompt_to_send += (
-                f"\n\nThe previous code failed with this error:\n{error_message}\n"
-                "Please fix the code and try again. Only output a complete, corrected Python script."
-            )
-
-        response = model.generate_content(prompt_to_send)
-        response_text = response.text
-        code = extract_code_from_response(response_text)
-        logging.info(f"Generated code (attempt {attempt+1}):\n{code}")
         with open("test_scraper.py", "w") as f:
             f.write(code)
+
+        logging.info(f"Generated code saved ({len(code)} chars)")
+
+        # Execute the generated code
         result = subprocess.run(
             ["python", "test_scraper.py"],
-            capture_output=True, text=True, timeout=180
+            capture_output=True,
+            text=True,
+            timeout=180  # 3 minutes max
         )
+
         output = result.stdout.strip()
         if not output:
             output = result.stderr.strip()
+
+        # Parse results
         try:
             answers = json.loads(output)
-            return answers  # Success! Return immediately without validation
-        except Exception:
-            error_message = output
-            logging.error(f"Attempt {attempt+1} failed. Error:\n{error_message}\n")
+            logging.info("Code execution successful")
+            return answers
+        except json.JSONDecodeError:
+            return [f"Execution output: {output[:500]}"]
 
-    logging.error(f"Failed after {MAX_RETRIES} attempts. Last error: {error_message}")
-    return {"error": f"Failed after {MAX_RETRIES} attempts. Last error: {error_message}"}
+    except subprocess.TimeoutExpired:
+        return ["Error: Analysis timed out (3 minutes exceeded)"]
+    except Exception as e:
+        logging.error(f"Analysis error: {str(e)}")
+        return [f"Error: {str(e)}"]
 
-def extract_code_from_response(response_text):
-    match = re.search(r"```(?:python)?(.*?)```", response_text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return response_text.strip()
-
-async def process_universal_question(url: str, questions: list):
+@app.post("/api/")
+async def data_analyst_endpoint(
+    questions_txt: UploadFile = File(alias="questions.txt"),
+    additional_files: List[UploadFile] = File(default=[])
+):
     """
-    Scrape the site and answer the questions.
-    """
-    # --- Scrape the site ---
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle")
-        html = await page.content()
-        await browser.close()
-    soup = BeautifulSoup(html, "html.parser")
-
-def answer_questions_from_file(filepath: str):
-    """
-    Reads questions from a .txt file, tries to answer each using Gemini (web/LLM),
-    and if needed, generates and executes code to answer, returning a JSON array of answers.
+    Data Analyst Agent endpoint
+    Accepts questions.txt (required) and optional additional files
     """
     try:
-        with open(filepath, "r") as f:
-            questions = [q.strip() for q in f.readlines() if q.strip()]
-        if not questions:
-            return ["No questions found in the file."]
-        answers = []
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model = genai.GenerativeModel("gemini-2.5-pro")
-        for i, question in enumerate(questions):
-            logging.info(f"Processing question {i+1}: {question}")
-            direct_prompt = f"""
-Question: {question}
+        # Read questions
+        questions_content = (await questions_txt.read()).decode("utf-8")
+        if not questions_content.strip():
+            return JSONResponse(
+                content={"error": "questions.txt is empty"}, 
+                status_code=400
+            )
 
-Can you answer this question directly using your knowledge or general web information? 
-If you can provide a confident, accurate answer without needing to scrape specific websites, 
-data analysis, or custom code execution, please provide the answer.
+        # Process additional files if any
+        file_info = []
+        for file in additional_files:
+            if file.filename:
+                content = await file.read()
+                file_info.append({
+                    "filename": file.filename,
+                    "size": len(content),
+                    "type": file.content_type
+                })
+                # Save file for potential use by generated code
+                with open(file.filename, "wb") as f:
+                    f.write(content)
 
-If this question requires:
-- Scraping specific websites for current data
-- Numerical analysis or calculations on scraped data  
-- Creating visualizations/plots
-- Complex data processing
+        logging.info(f"Processing questions with {len(file_info)} additional files")
 
-Then respond with exactly: "CODE_REQUIRED"
+        # Analyze data
+        result = analyze_data(questions_content, additional_files)
+        
+        return JSONResponse(content=result)
 
-Otherwise, provide your direct answer.
-"""
-            try:
-                response = model.generate_content(direct_prompt)
-                direct_answer = response.text.strip()
-                if "CODE_REQUIRED" not in direct_answer:
-                    answers.append(direct_answer)
-                    logging.info(f"Question {i+1} answered directly")
-                    continue
-                # 2c. Generate and execute code for complex questions
-                logging.info(f"Question {i+1} requires code generation")
-                code_prompt = f"""
-You need to write a complete Python script to answer this question:
-{question}
-
-Requirements:
-- Write a complete, standalone Python script
-- Include all necessary imports
-- Handle errors gracefully
-- At the end, print the answer as a JSON array of strings using:
-  import json
-  print(json.dumps([answer]))
-- If creating plots, encode as base64 PNG data URI under 100,000 bytes
-- Make the code robust and handle edge cases
-
-Generate the complete Python script:
-"""
-                code_response = model.generate_content(code_prompt)
-                code = extract_code_from_response(code_response.text)
-                if not code:
-                    answers.append(f"Error: Could not generate code for question: {question}")
-                    continue
-                logging.info(f"Generated code for question {i+1}:\n{code}")
-                # Execute the generated code
-                temp_file = f"temp_question_{i+1}.py"
-                with open(temp_file, "w") as f:
-                    f.write(code)
-                result = subprocess.run(
-                    ["python", temp_file],
-                    capture_output=True, 
-                    text=True, 
-                    timeout=180
-                )
-                output = result.stdout.strip()
-                if not output:
-                    output = result.stderr.strip()
-                try:
-                    code_answers = json.loads(output)
-                    if isinstance(code_answers, list) and len(code_answers) > 0:
-                        answers.append(str(code_answers[0]))
-                    else:
-                        answers.append(str(code_answers))
-                    logging.info(f"Question {i+1} answered via code execution")
-                except json.JSONDecodeError:
-                    answers.append(f"Code output: {output}")
-                    logging.warning(f"Question {i+1} code output was not valid JSON")
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            except Exception as e:
-                error_msg = f"Error processing question '{question}': {str(e)}"
-                answers.append(error_msg)
-                logging.error(error_msg)
-        return answers
-    except FileNotFoundError:
-        return ["questions.txt file not found"]
     except Exception as e:
-        return [f"Failed to process questions: {str(e)}"]
+        logging.error(f"Endpoint error: {str(e)}")
+        return JSONResponse(
+            content={"error": f"Internal error: {str(e)}"}, 
+            status_code=500
+        )
 
-# Add this endpoint to use the function
-@app.post("/api/auto-answer")
-async def auto_answer_endpoint():
-    """
-    Automatically answers questions from questions.txt file
-    """
-    try:
-        answers = answer_questions_from_file()
-        return {
-            "answers": answers,
-            "message": "Questions processed successfully!"
-        }
-    except Exception as e:
-        return {"error": f"Failed to process questions: {str(e)}"}
+@app.get("/")
+async def root():
+    return {
+        "message": "Data Analyst Agent API",
+        "usage": "POST /api/ with questions.txt and optional files",
+        "example": 'curl -F "questions.txt=@questions.txt" -F "data.csv=@data.csv" http://localhost:8000/api/'
+    }
 
-@app.post("/")
-async def answer_questions(file: UploadFile = File(...)):
-    try:
-        # Save uploaded file to a temp location
-        suffix = os.path.splitext(file.filename)[-1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
-        answers = answer_questions_from_file(tmp_path)
-        os.remove(tmp_path)
-        return JSONResponse(content=answers)
-    except Exception as e:
-        return JSONResponse(content=[f"Error: {str(e)}"], status_code=500)
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "data-analyst-agent"}
