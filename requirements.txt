@@ -11,3 +11,4 @@ aiofiles
 requests
 python-multipart
 seaborn
+lxml
