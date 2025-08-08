@@ -149,7 +149,7 @@ async def scrape_with_query(url: str, query: str) -> Dict[str, Any]:
     """
     # Configure Gemini to help determine selectors
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-pro")
+    model = genai.GenerativeModel("gemini-2.5-pro")
     
     try:
         # Get CSS selector from query using Gemini
