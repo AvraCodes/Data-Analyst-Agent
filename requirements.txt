@@ -10,3 +10,4 @@ openai
 aiofiles
 requests
 python-multipart
+seaborn
