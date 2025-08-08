@@ -1,6 +1,6 @@
-python-multipart
 fastapi
 uvicorn
+python-multipart
 python-dotenv
 google-generativeai
 requests
@@ -14,3 +14,11 @@ html5lib
 openpyxl
 aiofiles
 pillow
+matplotlib
+seaborn
+scikit-learn
+tqdm
+plotly
+PyMuPDF
+pdfplumber
+pytesseract
