@@ -1,3 +1,4 @@
+python-multipart
 fastapi==0.104.1
 uvicorn
 python-dotenv==1.0.0
